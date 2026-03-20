@@ -275,6 +275,12 @@ DANGEROUS_MERGE_FUNCS = {
     'deepMerge', 'deepExtend', 'deepClone',
 }
 
+# Built-in types whose .set() / .add() methods are NOT prototype pollution
+_SAFE_SET_CONSTRUCTORS = frozenset({
+    'Map', 'Set', 'WeakMap', 'WeakSet',
+    'Headers', 'URLSearchParams', 'FormData',
+})
+
 SAFE_FUNCTIONS = {
     'encodeURIComponent', 'encodeURI', 'escape',
     'sanitize', 'sanitizeHtml', 'sanitizeHTML', 'sanitizeUrl',
@@ -443,24 +449,173 @@ def check_proto_in_text(text: str) -> Optional[str]:
     return None
 
 
+def _is_builtin_collection_var(root: Node, var_name: str) -> bool:
+    """Check if *var_name* was initialised with ``new Map()``, ``new Set()``, etc.
+
+    Walks all ``variable_declarator`` nodes under *root* and returns ``True``
+    when the initialiser is a ``new_expression`` whose constructor is in
+    ``_SAFE_SET_CONSTRUCTORS``.
+    """
+    for decl in find_nodes(root, 'variable_declarator'):
+        name_node = get_child_by_field(decl, 'name')
+        if name_node and node_text(name_node) == var_name:
+            value_node = get_child_by_field(decl, 'value')
+            if value_node and value_node.type == 'new_expression':
+                ctor = get_child_by_field(value_node, 'constructor')
+                if ctor is None:
+                    # Fallback: first child is usually the constructor identifier
+                    for ch in value_node.children:
+                        if ch.type == 'identifier':
+                            ctor = ch
+                            break
+                if ctor and node_text(ctor) in _SAFE_SET_CONSTRUCTORS:
+                    return True
+    return False
+
+
 # ============================================================================
 # TaintTracker
 # ============================================================================
 
+class _ScopedTaintProxy(dict):
+    """Proxy that makes scoped taint look like a flat dict for backward compat.
+
+    Reads aggregate across all scopes (any scope match returns taint).
+    Writes go to scope 0 (top-level).  Only used for legacy code paths
+    that directly access tracker.tainted[name].
+    """
+
+    def __init__(self, tracker: 'TaintTracker'):
+        super().__init__()
+        self._tracker = tracker
+
+    def __contains__(self, key):
+        return any(
+            k[1] == key for k in self._tracker._scoped_taint
+        )
+
+    def __getitem__(self, key):
+        # Return the first match across all scopes
+        for k, v in self._tracker._scoped_taint.items():
+            if k[1] == key:
+                return v
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        for k, v in self._tracker._scoped_taint.items():
+            if k[1] == key:
+                return v
+        return default
+
+    def __setitem__(self, key, value):
+        self._tracker._scoped_taint[(0, key)] = value
+
+    def __delitem__(self, key):
+        to_del = [k for k in self._tracker._scoped_taint if k[1] == key]
+        for k in to_del:
+            del self._tracker._scoped_taint[k]
+
+    def items(self):
+        seen = set()
+        for (sid, name), v in self._tracker._scoped_taint.items():
+            if name not in seen:
+                seen.add(name)
+                yield name, v
+
+    def keys(self):
+        return {name for _, name in self._tracker._scoped_taint}
+
+    def values(self):
+        return [v for _, v in self.items()]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return len(self.keys())
+
+    def clear(self):
+        self._tracker._scoped_taint.clear()
+
 class TaintTracker:
     """Tracks tainted variables through JavaScript code using tree-sitter nodes."""
+
+    # Scope-aware taint tracking: variables are keyed by (scope_id, name).
+    # scope_id is the start_byte of the enclosing function node (0 for top-level).
+    # is_tainted_node walks up the scope chain so inner scopes see outer taint.
+
+    _SCOPE_TYPES = frozenset({
+        'function_declaration', 'function', 'arrow_function',
+        'generator_function', 'generator_function_declaration',
+        'method_definition',
+    })
 
     def __init__(self, root: Node, source_lines: List[str]):
         self.root = root
         self.source_lines = source_lines
-        self.tainted: Dict[str, TaintedVar] = {}
+        # Scope-aware: (scope_id, var_name) -> TaintedVar
+        self._scoped_taint: Dict[Tuple[int, str], TaintedVar] = {}
+        # Legacy compat shim — flat view for code that reads self.tainted directly
+        self.tainted: Dict[str, TaintedVar] = _ScopedTaintProxy(self)
         self.function_params: Set[str] = set()
         # Set by JSASTAnalyzer after _build_function_summaries for inter-procedural analysis
         self.function_summaries: Dict[str, 'FunctionSummary'] = {}
         # Track variables assigned from pure literals — these are provably safe
         self.safe_literals: Set[str] = set()
+        # Map scope_id -> parent scope_id for walking scope chains
+        self._scope_parents: Dict[int, int] = {}
+        self._build_scope_tree(root, 0)
         self._collect_safe_literals(root)
         self._propagate_taint()
+
+    def _build_scope_tree(self, node: Node, parent_scope: int):
+        """Build mapping of scope_id -> parent_scope_id."""
+        current_scope = parent_scope
+        if node.type in self._SCOPE_TYPES:
+            current_scope = node.start_byte
+            # Avoid self-loops: tree-sitter may produce sibling scope nodes
+            # (e.g. function_declaration + function) at the same start_byte.
+            # Only record the parent for the first one we encounter; skip if
+            # the scope_id already has a parent assigned or would point to itself.
+            if current_scope != parent_scope and current_scope not in self._scope_parents:
+                self._scope_parents[current_scope] = parent_scope
+        for child in node.children:
+            self._build_scope_tree(child, current_scope)
+
+    def _get_scope_id(self, node: Node) -> int:
+        """Find the scope_id (start_byte of enclosing function) for a node."""
+        cur = node.parent
+        while cur:
+            if cur.type in self._SCOPE_TYPES:
+                return cur.start_byte
+            cur = cur.parent
+        return 0  # top-level
+
+    def _set_taint(self, var_name: str, taint: TaintedVar, scope_id: int):
+        """Set taint for a variable in a specific scope."""
+        self._scoped_taint[(scope_id, var_name)] = taint
+
+    def _get_taint(self, var_name: str, scope_id: int) -> Optional[TaintedVar]:
+        """Look up taint for a variable, walking up the scope chain."""
+        sid = scope_id
+        visited: set = set()
+        while True:
+            if sid in visited:
+                break  # cycle guard
+            visited.add(sid)
+            t = self._scoped_taint.get((sid, var_name))
+            if t is not None:
+                return t
+            parent = self._scope_parents.get(sid)
+            if parent is None:
+                break
+            sid = parent
+        # Check top-level (scope 0)
+        return self._scoped_taint.get((0, var_name))
+
+    def _remove_taint(self, var_name: str, scope_id: int):
+        """Remove taint for a variable in a specific scope."""
+        self._scoped_taint.pop((scope_id, var_name), None)
 
     def _collect_safe_literals(self, root: Node):
         """Identify variables that are assigned from pure string/number literals.
@@ -515,6 +670,8 @@ class TaintTracker:
 
     def _propagation_pass(self, root: Node):
         """Single pass: walk variable declarations and assignments to propagate taint."""
+        _LITERAL_TYPES = {'string', 'number', 'true', 'false', 'null', 'undefined'}
+
         # Variable declarations (var/let/const)
         for decl in find_nodes_multi(root, {'variable_declarator'}):
             name_node = get_child_by_field(decl, 'name')
@@ -536,20 +693,21 @@ class TaintTracker:
                 continue
 
             var_name = node_text(name_node)
+            scope_id = self._get_scope_id(decl)
             source = self._check_source(value_node)
             if source:
-                self.tainted[var_name] = TaintedVar(
+                self._set_taint(var_name, TaintedVar(
                     name=var_name, line=get_node_line(decl),
                     source_type=source[0], source_code=node_text(value_node)
-                )
+                ), scope_id)
                 continue
 
             taint = self.is_tainted_node(value_node)
-            if taint and var_name not in self.tainted:
-                self.tainted[var_name] = TaintedVar(
+            if taint and self._get_taint(var_name, scope_id) is None:
+                self._set_taint(var_name, TaintedVar(
                     name=var_name, line=get_node_line(decl),
                     source_type=taint.source_type, source_code=taint.source_code
-                )
+                ), scope_id)
 
         # Assignment expressions
         for assign in find_nodes(root, 'assignment_expression'):
@@ -561,19 +719,24 @@ class TaintTracker:
                 continue
 
             var_name = node_text(left)
+            scope_id = self._get_scope_id(assign)
             source = self._check_source(right)
             if source:
-                self.tainted[var_name] = TaintedVar(
+                self._set_taint(var_name, TaintedVar(
                     name=var_name, line=get_node_line(assign),
                     source_type=source[0], source_code=node_text(right)
-                )
-            elif var_name not in self.tainted:
-                taint = self.is_tainted_node(right)
-                if taint:
-                    self.tainted[var_name] = TaintedVar(
-                        name=var_name, line=get_node_line(assign),
-                        source_type=taint.source_type, source_code=taint.source_code
-                    )
+                ), scope_id)
+            else:
+                # Fix: reassignment to a literal KILLS taint in this scope
+                if right.type in _LITERAL_TYPES:
+                    self._remove_taint(var_name, scope_id)
+                elif self._get_taint(var_name, scope_id) is None:
+                    taint = self.is_tainted_node(right)
+                    if taint:
+                        self._set_taint(var_name, TaintedVar(
+                            name=var_name, line=get_node_line(assign),
+                            source_type=taint.source_type, source_code=taint.source_code
+                        ), scope_id)
 
         # Track function params
         for func in find_nodes_multi(root, {'function_declaration', 'function', 'arrow_function'}):
@@ -611,27 +774,28 @@ class TaintTracker:
             then_args = get_call_args(call)
             if then_args and then_args[0].type in ('arrow_function', 'function'):
                 cb = then_args[0]
+                cb_scope = cb.start_byte  # the callback IS a scope
                 cb_params = get_child_by_field(cb, 'parameters')
                 if not cb_params:
                     cb_param = get_child_by_field(cb, 'parameter')
                     if cb_param and cb_param.type == 'identifier':
                         pname = node_text(cb_param)
-                        if pname not in self.tainted:
-                            self.tainted[pname] = TaintedVar(
+                        if self._get_taint(pname, cb_scope) is None:
+                            self._set_taint(pname, TaintedVar(
                                 name=pname, line=get_node_line(cb),
                                 source_type=taint.source_type,
                                 source_code=f".then({pname})"
-                            )
+                            ), cb_scope)
                 elif cb_params:
                     for child in cb_params.children:
                         if child.type == 'identifier':
                             pname = node_text(child)
-                            if pname not in self.tainted:
-                                self.tainted[pname] = TaintedVar(
+                            if self._get_taint(pname, cb_scope) is None:
+                                self._set_taint(pname, TaintedVar(
                                     name=pname, line=get_node_line(cb),
                                     source_type=taint.source_type,
                                     source_code=f".then({pname})"
-                                )
+                                ), cb_scope)
                             break  # only first param
 
     def _handle_object_destructuring(self, pattern: Node, value_node: Node):
@@ -643,6 +807,7 @@ class TaintTracker:
 
         source_type = source[0] if source else taint.source_type
         source_code = node_text(value_node)
+        scope_id = self._get_scope_id(pattern)
 
         for child in pattern.children:
             var_name = None
@@ -658,10 +823,10 @@ class TaintTracker:
                         var_name = node_text(key)
 
             if var_name:
-                self.tainted[var_name] = TaintedVar(
+                self._set_taint(var_name, TaintedVar(
                     name=var_name, line=get_node_line(pattern),
                     source_type=source_type, source_code=f"{source_code}.{var_name}"
-                )
+                ), scope_id)
 
     def _handle_array_destructuring(self, pattern: Node, value_node: Node):
         """Handle const [a, b] = taintedSource."""
@@ -672,13 +837,14 @@ class TaintTracker:
 
         source_type = source[0] if source else taint.source_type
         source_code = node_text(value_node)
+        scope_id = self._get_scope_id(pattern)
 
         for i, child in enumerate(c for c in pattern.children if c.type == 'identifier'):
             var_name = node_text(child)
-            self.tainted[var_name] = TaintedVar(
+            self._set_taint(var_name, TaintedVar(
                 name=var_name, line=get_node_line(pattern),
                 source_type=source_type, source_code=f"{source_code}[{i}]"
-            )
+            ), scope_id)
 
     def _check_source(self, node: Node) -> Optional[Tuple[str, str]]:
         """Check if node is a taint source. Returns (source_type, confidence) or None."""
@@ -766,7 +932,11 @@ class TaintTracker:
                 if method == 'getItem' and obj_name in ('localStorage', 'sessionStorage'):
                     return ('storage', 'MEDIUM')
                 if method in ('json', 'text'):
-                    return ('fetch_response', 'MEDIUM')
+                    # Only treat as source if the receiver object is itself tainted
+                    obj_node = get_child_by_field(callee, 'object')
+                    if obj_node and self.is_tainted_node(obj_node):
+                        return ('fetch_response', 'MEDIUM')
+                    return None
                 # JSON.parse: only a source if its argument is tainted
                 if obj_name == 'JSON' and method == 'parse':
                     parse_args = get_call_args(node)
@@ -806,7 +976,8 @@ class TaintTracker:
 
         if node.type == 'identifier':
             name = node_text(node)
-            return self.tainted.get(name)
+            scope_id = self._get_scope_id(node)
+            return self._get_taint(name, scope_id)
 
         if node.type == 'member_expression':
             obj = get_child_by_field(node, 'object')
@@ -816,7 +987,8 @@ class TaintTracker:
                     return t
             full = node_text(node)
             base = full.split('.')[0].split('[')[0]
-            t = self.tainted.get(base)
+            scope_id = self._get_scope_id(node)
+            t = self._get_taint(base, scope_id)
             if t:
                 return t
             # Fall through to _check_source at bottom
@@ -850,7 +1022,12 @@ class TaintTracker:
             if callee:
                 # Safe/neutralizing functions break taint chain
                 if callee.type == 'identifier':
-                    if node_text(callee) in TAINT_NEUTRALIZING_FUNCS:
+                    _fname = node_text(callee)
+                    if _fname in TAINT_NEUTRALIZING_FUNCS:
+                        return None
+                    # Also check for common sanitizer-like function names
+                    _fname_lower = _fname.lower()
+                    if any(kw in _fname_lower for kw in ('sanitize', 'escape', 'encode', 'purify', 'clean')):
                         return None
                 elif callee.type == 'member_expression':
                     obj_name = node_text(get_child_by_field(callee, 'object') or callee)
@@ -1280,12 +1457,13 @@ class JSASTAnalyzer:
                 if name_node.type != 'identifier':
                     continue
                 var_name = node_text(name_node)
-                if var_name in self.tracker.tainted:
+                scope_id = self.tracker._get_scope_id(decl)
+                if self.tracker._get_taint(var_name, scope_id) is not None:
                     continue  # already tainted
 
                 taint_info = self._check_interprocedural_call(value_node)
                 if taint_info:
-                    self.tracker.tainted[var_name] = taint_info
+                    self.tracker._set_taint(var_name, taint_info, scope_id)
                     new_taints += 1
 
             # --- Assignment expressions: result = userFunc(taintedArg) ---
@@ -1297,12 +1475,13 @@ class JSASTAnalyzer:
                 if left.type != 'identifier':
                     continue
                 var_name = node_text(left)
-                if var_name in self.tracker.tainted:
+                scope_id = self.tracker._get_scope_id(assign)
+                if self.tracker._get_taint(var_name, scope_id) is not None:
                     continue
 
                 taint_info = self._check_interprocedural_call(right)
                 if taint_info:
-                    self.tracker.tainted[var_name] = taint_info
+                    self.tracker._set_taint(var_name, taint_info, scope_id)
                     new_taints += 1
 
             if new_taints == 0:
@@ -1322,6 +1501,15 @@ class JSASTAnalyzer:
             return None
 
         func_name = node_text(callee)
+
+        # Don't propagate taint through sanitizer/neutralizing functions
+        if func_name in TAINT_NEUTRALIZING_FUNCS or func_name in SAFE_FUNCTIONS:
+            return None
+        # Also check for common sanitizer-like function names
+        func_lower = func_name.lower()
+        if any(kw in func_lower for kw in ('sanitize', 'escape', 'encode', 'purify', 'clean')):
+            return None
+
         summary = self.function_summaries.get(func_name)
         if not summary:
             return None
@@ -1365,6 +1553,82 @@ class JSASTAnalyzer:
             full = f"{obj}.{method}"
             if any(safe in full for safe in SAFE_FUNCTIONS):
                 return True
+        return False
+
+    # Template engine names whose rendering output is auto-escaped (safe for XSS)
+    _TEMPLATE_ENGINE_OBJECTS = frozenset({
+        'ejs', 'pug', 'jade', 'nunjucks', 'Handlebars', 'handlebars', 'hbs',
+        'mustache', 'Mustache', 'doT', 'dot', 'dust',
+    })
+    _TEMPLATE_RENDER_METHODS = frozenset({
+        'render', 'renderString', 'compile', 'renderFile',
+    })
+
+    def _is_template_engine_output(self, node: Node) -> bool:
+        """Check if a node is the output of a template engine call with a static template.
+
+        Template engines auto-escape by default, so their output passed to
+        res.send() is not an XSS vulnerability when the template itself is
+        static (only the data is user-controlled).
+        """
+        if not node:
+            return False
+
+        # Direct call: nunjucks.renderString('static', {data})
+        if node.type == 'call_expression':
+            callee = get_child_by_field(node, 'function')
+            if callee and callee.type == 'member_expression':
+                obj_n = get_child_by_field(callee, 'object')
+                method_n = get_child_by_field(callee, 'property')
+                if obj_n and method_n:
+                    obj_name = node_text(obj_n)
+                    method_name = node_text(method_n)
+                    if (obj_name in self._TEMPLATE_ENGINE_OBJECTS
+                            and method_name in self._TEMPLATE_RENDER_METHODS):
+                        args = get_call_args(node)
+                        if args and args[0].type == 'string':
+                            return True  # Static template with tainted data
+            # Compiled template function call: compiledFn({data})
+            # e.g., const fn = pug.compile('static'); fn({name: tainted})
+            if callee and callee.type == 'identifier':
+                var_name = node_text(callee)
+                # Check if this variable was assigned from a template compile call
+                if self._is_compiled_template_var(var_name):
+                    return True
+            return False
+
+        # Identifier: variable holding template output
+        if node.type == 'identifier':
+            var_name = node_text(node)
+            # Walk up to find the assignment
+            for decl in find_nodes(self.root, 'variable_declarator'):
+                name_n = get_child_by_field(decl, 'name')
+                value_n = get_child_by_field(decl, 'value')
+                if name_n and node_text(name_n) == var_name and value_n:
+                    return self._is_template_engine_output(value_n)
+        return False
+
+    def _is_compiled_template_var(self, var_name: str) -> bool:
+        """Check if a variable was assigned from a template engine compile() call
+        with a static template string."""
+        for decl in find_nodes(self.root, 'variable_declarator'):
+            name_n = get_child_by_field(decl, 'name')
+            value_n = get_child_by_field(decl, 'value')
+            if not name_n or node_text(name_n) != var_name or not value_n:
+                continue
+            if value_n.type == 'call_expression':
+                callee = get_child_by_field(value_n, 'function')
+                if callee and callee.type == 'member_expression':
+                    obj_n = get_child_by_field(callee, 'object')
+                    method_n = get_child_by_field(callee, 'property')
+                    if obj_n and method_n:
+                        obj_name = node_text(obj_n)
+                        method_name = node_text(method_n)
+                        if (obj_name in self._TEMPLATE_ENGINE_OBJECTS
+                                and method_name in ('compile', 'precompile')):
+                            args = get_call_args(value_n)
+                            if args and args[0].type == 'string':
+                                return True
         return False
 
     def _has_dynamic_content(self, node: Node) -> bool:
@@ -1704,26 +1968,56 @@ class JSASTAnalyzer:
                 if func_name in COMMAND_SINKS and args:
                     cat, sev, cwe = COMMAND_SINKS[func_name]
 
-                    # Check if first arg is tainted
+                    # Detect {shell: true} in options argument
+                    _has_shell_true = False
+                    _opts_idx = 2 if func_name in ('spawn', 'spawnSync', 'execFile', 'execFileSync') else 1
+                    if len(args) > _opts_idx:
+                        opts_text = node_text(args[_opts_idx])
+                        if 'shell' in opts_text and 'true' in opts_text:
+                            _has_shell_true = True
+
+                    # spawn/execFile with array args and no shell:true is safe
+                    # against shell injection by design
+                    _is_safe_spawn = (
+                        func_name in ('spawn', 'spawnSync', 'execFile', 'execFileSync')
+                        and not _has_shell_true
+                        and len(args) >= 2
+                        and args[1].type == 'array'
+                    )
+
+                    # Check all args for taint
                     taint = None
+                    taint_arg = args[0]
                     for a in args:
                         taint = self.tracker.is_tainted_node(a)
                         if taint:
+                            taint_arg = a
                             break
 
                     if taint:
-                        # Proven taint → always flag
-                        self._add_finding(
-                            call, f"Command Injection via {func_name}()",
-                            cat, sev, 'HIGH',
-                            f"Tainted data from '{taint.source_type}' used in "
-                            f"command execution via {func_name}().",
-                            cwe,
-                            REMEDIATION_MAP.get(func_name,
-                                "Never pass user input directly to command execution."),
-                            source=taint.source_code, sink=f"{func_name}()"
-                        )
-                    elif (self._has_dynamic_content(args[0])
+                        if _is_safe_spawn and taint_arg != args[0]:
+                            # Taint only in args array, not command — lower risk
+                            self._add_finding(
+                                call, f"Command Injection via {func_name}()",
+                                cat, Severity.MEDIUM, 'MEDIUM',
+                                f"Tainted data from '{taint.source_type}' in args array of {func_name}(). "
+                                f"Without {{shell: true}}, injection risk is reduced but args may still be dangerous.",
+                                cwe, REMEDIATION_MAP.get(func_name, "Validate arguments against an allowlist."),
+                                source=taint.source_code, sink=f"{func_name}()"
+                            )
+                        else:
+                            shell_note = " with {shell: true}" if _has_shell_true else ""
+                            self._add_finding(
+                                call, f"Command Injection via {func_name}()",
+                                cat, sev, 'HIGH',
+                                f"Tainted data from '{taint.source_type}' used in "
+                                f"command execution via {func_name}(){shell_note}.",
+                                cwe,
+                                REMEDIATION_MAP.get(func_name,
+                                    "Never pass user input directly to command execution."),
+                                source=taint.source_code, sink=f"{func_name}()"
+                            )
+                    elif not _is_safe_spawn and (self._has_dynamic_content(args[0])
                           and not self._is_sanitized(args[0])):
                         # Dynamic content without proven taint
                         # For ambiguous 'exec', only flag if it's a known
@@ -1832,7 +2126,12 @@ class JSASTAnalyzer:
                         self._check_sink(call, args[0], method, CALL_SINKS[method])
 
                 # Dangerous merge functions
-                elif method in DANGEROUS_MERGE_FUNCS and method != 'assign':
+                # Exclude Express response objects (res.set() is header setting, not merge)
+                # Exclude built-in collection types (Map, Set, etc.) whose .set() is safe
+                elif (method in DANGEROUS_MERGE_FUNCS and method != 'assign'
+                      and obj_str not in ('res', 'response')
+                      and not (method in ('set', 'setWith')
+                               and _is_builtin_collection_var(self.root, obj_str))):
                     is_deep = (method == 'extend' and args and
                                node_text(args[0]) == 'true')
                     base_conf = 'HIGH' if is_deep or method in ('merge', 'mergeWith', 'defaultsDeep') else 'MEDIUM'
@@ -1862,14 +2161,19 @@ class JSASTAnalyzer:
                         arg = args[0]
                         taint = self.tracker.is_tainted_node(arg)
                         if taint:
-                            cat, sev, cwe = EXPRESS_SINKS[method]
-                            self._add_finding(
-                                call, f"Reflected XSS via {method}()",
-                                cat, sev, 'HIGH',
-                                f"Tainted data from '{taint.source_type}' reflected in HTTP response via {method}()",
-                                cwe, "Escape HTML entities before including in response, or use res.json()",
-                                source=taint.source_code, sink=f"res.{method}()"
-                            )
+                            # Skip if the value comes from a template engine
+                            # rendering call with a static template (auto-escaped)
+                            if self._is_template_engine_output(arg):
+                                pass  # Template engines auto-escape; not XSS
+                            else:
+                                cat, sev, cwe = EXPRESS_SINKS[method]
+                                self._add_finding(
+                                    call, f"Reflected XSS via {method}()",
+                                    cat, sev, 'HIGH',
+                                    f"Tainted data from '{taint.source_type}' reflected in HTTP response via {method}()",
+                                    cwe, "Escape HTML entities before including in response, or use res.json()",
+                                    source=taint.source_code, sink=f"res.{method}()"
+                                )
 
                 # Express res.redirect() — open redirect
                 elif method == 'redirect' and obj_str in ('res', 'response'):
@@ -1897,8 +2201,12 @@ class JSASTAnalyzer:
                 # Skip exec() unless the object is a known child_process alias
                 elif method in COMMAND_SINKS and not (
                     method == 'exec' and obj_node and (
+                        # Regex literal: /pattern/.exec() is RegExp, not child_process
+                        obj_node.type == 'regex'
+                        # new RegExp(...).exec() is also RegExp, not child_process
+                        or obj_node.type == 'new_expression'
                         # Mongoose pattern: Model.find().exec()
-                        obj_node.type == 'call_expression'
+                        or obj_node.type == 'call_expression'
                         # Not a child_process alias
                         or (obj_node.type == 'identifier'
                             and node_text(obj_node) not in self.child_process_aliases
@@ -2461,11 +2769,8 @@ class JSASTAnalyzer:
             # The template string is typically the first argument
             template_arg = args[0]
 
-            # Safe: static template string
+            # Safe: static template string (also covers renderFile with static path)
             if template_arg.type == 'string':
-                continue
-            # Safe: template file path (renderFile with static path)
-            if method == 'renderFile' and template_arg.type == 'string':
                 continue
 
             taint = self.tracker.is_tainted_node(template_arg)
